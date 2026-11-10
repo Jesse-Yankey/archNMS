@@ -1,0 +1,6 @@
+fastapi>=0.110
+uvicorn[standard]>=0.29
+apscheduler>=3.10,<4
+netmiko>=4.3   # only needed when ARCH_MODE=live
+cryptography>=42
+pysnmp>=7.1,<8

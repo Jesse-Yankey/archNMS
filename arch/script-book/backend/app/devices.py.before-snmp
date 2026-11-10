@@ -1,0 +1,97 @@
+"""Backend for the Devices tab: add, test, list, remove."""
+import ipaddress, re, socket, time
+from datetime import datetime, timedelta, timezone
+from . import backup, demo, vault
+from .backup import event, utcnow
+from .db import connect
+
+# Labels used by the Add-device dialog -> Netmiko device_type.
+DRIVERS = {"Detect automatically": "autodetect", "Cisco IOS / IOS-XE": "cisco_ios", "Huawei VRP": "huawei",
+           "PLANET managed switch": "cisco_ios",   # Cisco-style CLI; change if your model needs something else
+           "Generic SNMP only": "snmp_only"}
+HOST_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$")
+RETENTION_DAYS = 90
+
+def _public(r) -> dict:
+    return {"id": r["id"], "ip": r["ip"], "role": r["role"], "site": r["site"], "model": r["model"], "driver": r["vendor"],
+            "poll_interval": r["poll_interval"], "snmp_version": r["snmp_version"], "ssh_user": r["ssh_user"],
+            "has_ssh_password": bool(r["ssh_enc"] and vault.decrypt_json(r["ssh_enc"]).get("password")),
+            "has_snmp": bool(r["snmp_enc"]), "added_by": r["added_by"], "added_at": r["added_at"]}
+
+def list_devices() -> list[dict]:
+    with connect() as c:
+        return [_public(r) for r in c.execute("SELECT * FROM arch_devices WHERE removed_at IS NULL ORDER BY id")]
+
+def _check(p: dict):
+    if not HOST_RX.match(p["host"]): raise ValueError("Hostname may use letters, numbers, dots and hyphens only.")
+    try:
+        if ipaddress.ip_address(p["ip"]).version != 4: raise ValueError
+    except ValueError: raise ValueError("Enter a valid IPv4 address, for example 10.99.0.31.")
+
+def _snmp_blob(p: dict) -> dict:
+    if p["snmp_version"] == "3":
+        return {k: p[f"snmp_v3_{k}"] for k in ("user", "sec", "auth", "priv", "key", "privkey")} if p["snmp_v3_user"] else {}
+    return {"community": p["snmp_community"]} if p["snmp_community"] else {}
+
+def add_device(p: dict, actor: str) -> dict:
+    _check(p)
+    driver = DRIVERS.get(p["driver"], p["driver"])
+    ssh = {k: v for k, v in (("password", p["ssh_password"]), ("enable", p["ssh_enable"])) if v}
+    snmp = _snmp_blob(p)
+    vals = dict(ip=p["ip"], vendor=driver, role=p["role"] or "Access", site=p["site"] or None, poll_interval=p["poll_interval"],
+                ssh_user=p["ssh_user"] or None, ssh_enc=vault.encrypt_json(ssh) if ssh else None,
+                snmp_version=p["snmp_version"], snmp_enc=vault.encrypt_json(snmp) if snmp else None,
+                added_by=actor, added_at=utcnow())
+    with connect() as c:
+        ex = c.execute("SELECT id, removed_at FROM arch_devices WHERE lower(id)=lower(?)", (p["host"],)).fetchone()
+        if ex and ex["removed_at"] is None: raise FileExistsError(f"{ex['id']} is already monitored.")
+        dup = c.execute("SELECT id FROM arch_devices WHERE ip=? AND removed_at IS NULL", (p["ip"],)).fetchone()
+        if dup: raise FileExistsError(f"{p['ip']} is already monitored as {dup['id']}.")
+        if ex:   # re-adding a recently removed device: bring its kept history back
+            did = ex["id"]
+            c.execute("UPDATE arch_devices SET " + ",".join(f"{k}=?" for k in vals) + ",removed_at=NULL,enabled=1 WHERE id=?", (*vals.values(), did))
+        else:
+            did = p["host"]
+            c.execute("INSERT INTO arch_devices(id," + ",".join(vals) + ") VALUES(?," + ",".join("?" * len(vals)) + ")", (did, *vals.values()))
+        event(c, "User", "info", f"{actor} added {did} ({p['ip']}).")
+        return _public(c.execute("SELECT * FROM arch_devices WHERE id=?", (did,)).fetchone())
+
+def remove_device(device_id: str, purge: bool, actor: str):
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM arch_devices WHERE id=? AND removed_at IS NULL", (device_id,)).fetchone():
+            raise KeyError(device_id)
+        if purge:
+            c.execute("DELETE FROM arch_devices WHERE id=?", (device_id,))     # cascades to versions, baseline, status
+        else:
+            c.execute("UPDATE arch_devices SET removed_at=?, enabled=0 WHERE id=?", (utcnow(), device_id))
+        event(c, "User", "warn", f"{actor} removed {device_id}" + (" and deleted its history." if purge else f". History kept for {RETENTION_DAYS} days."))
+
+def purge_expired():
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
+    with connect() as c:
+        c.execute("DELETE FROM arch_devices WHERE removed_at IS NOT NULL AND removed_at < ?", (cutoff,))
+
+def test_connection(p: dict) -> dict:
+    """Never saves anything. Live mode: TCP 22, then a real SSH login."""
+    try: _check(p)
+    except ValueError as e: return {"ok": False, "lines": [str(e)]}
+    if backup.MODE == "demo": return demo.fake_test(p)
+    ip, lines, t0 = p["ip"], [], time.time()
+    driver = DRIVERS.get(p["driver"], p["driver"])
+    try: socket.create_connection((ip, 22), timeout=5).close()
+    except OSError as e:
+        return {"ok": False, "lines": [f"Cannot reach {ip} on SSH (TCP 22): {e.strerror or e}.", "Check routing, ACLs, and that SSH is enabled on the device."]}
+    lines.append(f"Reachable on TCP 22 ({(time.time() - t0) * 1000:.0f} ms).")
+    if driver == "snmp_only":
+        return {"ok": True, "lines": lines + ["SNMP-only device: SSH was not tested and configuration backup is off.", "SNMP was not tested: the poller is not built yet."]}
+    user, pw, en = p["ssh_user"] or backup.SSH_USER, p["ssh_password"] or backup.SSH_PASS, p["ssh_enable"] or backup.SSH_ENABLE
+    if not user or not pw:
+        return {"ok": False, "lines": lines + ["SSH login not tested: username or password is missing."]}
+    try:
+        if driver == "autodetect": driver = backup.detect_driver(ip, user, pw)
+        conn = backup.open_ssh(ip, driver, user, pw, en)
+        try: prompt = conn.find_prompt()
+        finally: conn.disconnect()
+    except Exception as e:
+        return {"ok": False, "lines": lines + [backup.ssh_error_text(e)]}
+    return {"ok": True, "lines": lines + [f"SSH login accepted. Driver: {driver}. Prompt: {prompt}", "SNMP was not tested: the poller is not built yet."]}

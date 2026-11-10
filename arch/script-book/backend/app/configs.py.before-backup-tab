@@ -1,0 +1,57 @@
+"""Read side for the Configurations and Config drift tabs."""
+import difflib
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+from .backup import TZ_NAME, utcnow, event
+from .db import connect
+
+MAX_VERSIONS = 25
+
+def label(iso: str) -> str:
+    tz = ZoneInfo(TZ_NAME)
+    t = datetime.fromisoformat(iso).astimezone(tz); today = datetime.now(tz).date()
+    d = (today - t.date()).days
+    day = "Today" if d == 0 else "Yesterday" if d == 1 else t.strftime("%b %d")
+    return f"{day} {t:%H:%M}"
+
+def diff_counts(a: str, b: str) -> tuple[int, int]:
+    ops = list(difflib.unified_diff(a.split("\n"), b.split("\n"), lineterm="", n=0))
+    add = sum(1 for l in ops if l.startswith("+") and not l.startswith("+++"))
+    dele = sum(1 for l in ops if l.startswith("-") and not l.startswith("---"))
+    return add, dele
+
+def state() -> list[dict]:
+    """Shape matches what the existing frontend keeps in S.cfg: {baseline, versions[], fail}."""
+    out = []
+    with connect() as c:
+        for d in c.execute("SELECT id FROM arch_devices WHERE removed_at IS NULL ORDER BY id"):
+            vs = c.execute("SELECT id,taken_at,trigger,text FROM arch_config_versions WHERE device_id=? ORDER BY id DESC LIMIT ?",
+                           (d["id"], MAX_VERSIONS)).fetchall()
+            b = c.execute("SELECT v.text FROM arch_baselines b JOIN arch_config_versions v ON v.id=b.version_id WHERE b.device_id=?", (d["id"],)).fetchone()
+            s = c.execute("SELECT last_error FROM arch_backup_status WHERE device_id=?", (d["id"],)).fetchone()
+            out.append({"id": d["id"], "baseline": b["text"] if b else "", "fail": s["last_error"] if s else None,
+                        "versions": [{"id": v["id"], "label": label(v["taken_at"]), "taken_at": v["taken_at"],
+                                      "note": v["trigger"], "text": v["text"]} for v in vs]})
+    return out
+
+def drift_summary() -> list[dict]:
+    res = []
+    for s in state():
+        if not s["versions"]:
+            res.append({"id": s["id"], "status": "failed" if s["fail"] else "none", "add": 0, "del": 0}); continue
+        add, dele = diff_counts(s["baseline"], s["versions"][0]["text"])
+        status = "failed" if s["fail"] else "drift" if (add or dele) else "sync"
+        res.append({"id": s["id"], "status": status, "add": add, "del": dele})
+    return res
+
+def accept_baseline(device_id: str, actor: str) -> dict:
+    with connect() as c:
+        v = c.execute("SELECT id,text FROM arch_config_versions WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        if not v: raise LookupError("No backup exists yet")
+        old = c.execute("SELECT v.text FROM arch_baselines b JOIN arch_config_versions v ON v.id=b.version_id WHERE b.device_id=?", (device_id,)).fetchone()
+        add, dele = diff_counts(old["text"], v["text"]) if old else (0, 0)
+        c.execute("INSERT INTO arch_baselines(device_id,version_id,approved_by,approved_at) VALUES(?,?,?,?) "
+                  "ON CONFLICT(device_id) DO UPDATE SET version_id=excluded.version_id,approved_by=excluded.approved_by,approved_at=excluded.approved_at",
+                  (device_id, v["id"], actor, utcnow()))
+        event(c, "Backup", "info", f"{actor} accepted the current configuration of {device_id} as its baseline (+{add} −{dele}).")
+    return {"ok": True, "add": add, "del": dele}

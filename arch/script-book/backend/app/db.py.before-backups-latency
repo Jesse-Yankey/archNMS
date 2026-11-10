@@ -1,0 +1,108 @@
+import os, sqlite3
+from contextlib import contextmanager
+
+DB_PATH = os.environ.get("ARCH_DB", "arch.db")
+
+# All ARCH tables use the arch_ prefix.
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS arch_devices(
+  id TEXT PRIMARY KEY, ip TEXT NOT NULL,
+  vendor TEXT NOT NULL DEFAULT 'cisco_ios',      -- Netmiko device_type, or 'autodetect' / 'snmp_only'
+  model TEXT, role TEXT, enabled INTEGER NOT NULL DEFAULT 1,
+  site TEXT, poll_interval TEXT DEFAULT '1 minute',
+  ssh_user TEXT, ssh_enc TEXT,                    -- ssh_enc = encrypted {"password","enable"}
+  snmp_version TEXT, snmp_enc TEXT,               -- snmp_enc = encrypted community / SNMPv3 secrets
+  added_by TEXT, added_at TEXT, removed_at TEXT); -- removed_at set = soft-deleted, history kept 90 days
+CREATE TABLE IF NOT EXISTS arch_config_versions(
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  device_id TEXT NOT NULL REFERENCES arch_devices(id) ON DELETE CASCADE,
+  taken_at TEXT NOT NULL, trigger TEXT NOT NULL, sha256 TEXT NOT NULL, text TEXT NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_cv_dev ON arch_config_versions(device_id, id DESC);
+CREATE TABLE IF NOT EXISTS arch_baselines(
+  device_id TEXT PRIMARY KEY REFERENCES arch_devices(id) ON DELETE CASCADE,
+  version_id INTEGER NOT NULL REFERENCES arch_config_versions(id),
+  approved_by TEXT, approved_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS arch_backup_status(
+  device_id TEXT PRIMARY KEY REFERENCES arch_devices(id) ON DELETE CASCADE,
+  last_attempt TEXT, last_ok TEXT, last_error TEXT);
+CREATE TABLE IF NOT EXISTS arch_events(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+  category TEXT NOT NULL, level TEXT NOT NULL, text TEXT NOT NULL);
+    CREATE TABLE IF NOT EXISTS arch_interfaces (
+        device_id TEXT NOT NULL,
+        interface_index INTEGER NOT NULL,
+        name TEXT,
+        description TEXT,
+        interface_type INTEGER,
+        speed_bps INTEGER,
+        mtu INTEGER,
+        admin_status INTEGER,
+        oper_status INTEGER,
+        last_seen TEXT,
+        PRIMARY KEY (device_id, interface_index),
+        FOREIGN KEY (device_id)
+            REFERENCES arch_devices(id)
+            ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS arch_interface_poll_state (
+        device_id TEXT PRIMARY KEY,
+        last_attempt_at TEXT,
+        last_success_at TEXT,
+        last_error TEXT,
+        FOREIGN KEY (device_id)
+            REFERENCES arch_devices(id)
+            ON DELETE CASCADE
+    );
+
+    CREATE TABLE IF NOT EXISTS arch_interface_stats (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        device_id TEXT NOT NULL,
+        interface_index INTEGER NOT NULL,
+        collected_at TEXT NOT NULL,
+        in_octets INTEGER,
+        out_octets INTEGER,
+        in_errors INTEGER,
+        out_errors INTEGER,
+        in_mbps REAL,
+        out_mbps REAL,
+        FOREIGN KEY (device_id, interface_index)
+            REFERENCES arch_interfaces(device_id, interface_index)
+            ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_interface_stats_device_time
+        ON arch_interface_stats(device_id, interface_index, collected_at);
+
+    CREATE INDEX IF NOT EXISTS idx_interface_stats_collected
+        ON arch_interface_stats(collected_at);
+"""
+
+RENAMES = {"devices": "arch_devices", "config_versions": "arch_config_versions", "baselines": "arch_baselines",
+           "backup_status": "arch_backup_status", "events": "arch_events"}
+NEW_DEVICE_COLS = [("site", "TEXT"), ("poll_interval", "TEXT DEFAULT '1 minute'"), ("ssh_user", "TEXT"), ("ssh_enc", "TEXT"),
+                   ("snmp_version", "TEXT"), ("snmp_enc", "TEXT"), ("added_by", "TEXT"), ("added_at", "TEXT"), ("removed_at", "TEXT")]
+
+@contextmanager
+def connect():
+    c = sqlite3.connect(DB_PATH, timeout=15)
+    c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys=ON")
+    try:
+        yield c
+        c.commit()
+    finally:
+        c.close()
+
+def init():
+    """Create tables; also upgrades a database made by the first (Configurations/Drift) release."""
+    with connect() as c:
+        have = {r[0] for r in c.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+        for old, new in RENAMES.items():
+            if old in have and new not in have:
+                c.execute(f"ALTER TABLE {old} RENAME TO {new}")
+        c.executescript(SCHEMA)
+        cols = {r[1] for r in c.execute("PRAGMA table_info(arch_devices)")}
+        for name, typ in NEW_DEVICE_COLS:
+            if name not in cols:
+                c.execute(f"ALTER TABLE arch_devices ADD COLUMN {name} {typ}")

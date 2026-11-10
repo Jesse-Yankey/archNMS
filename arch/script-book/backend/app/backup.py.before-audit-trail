@@ -1,0 +1,138 @@
+"""Collects running configs, cleans/masks them, stores a new version only when it changed."""
+import hashlib, os, re
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from . import vault
+from .db import connect
+
+MODE = os.environ.get("ARCH_MODE", "demo")          # demo | live
+TZ_NAME = os.environ.get("ARCH_TZ", "UTC")           # Accra is UTC
+# Fallback login for devices that have no credentials of their own.
+SSH_USER = os.environ.get("ARCH_SSH_USER", "")
+SSH_PASS = os.environ.get("ARCH_SSH_PASS", "")
+SSH_ENABLE = os.environ.get("ARCH_SSH_ENABLE", "")
+SHOW_CMD = {"huawei": "display current-configuration"}
+
+# Lines that change on every pull and would create false drift.
+VOLATILE = re.compile(
+    r"^(Building configuration.*|Current configuration\s*:.*|"
+    r"!\s*(Last configuration change|NVRAM config last updated).*|"
+    r"!Time:.*|!Running configuration last done at.*|ntp clock-period.*)$", re.I | re.M)
+
+# Never store secrets in cleartext.
+SECRETS = [
+    (re.compile(r"^(\s*username\s+\S+.*?\b(?:secret|password)\s+(?:\d+\s+)?)\S+", re.I | re.M), r"\1********"),
+    (re.compile(r"^(\s*(?:enable\s+(?:secret|password)|tacacs-server key|radius-server key|key|pre-shared-key)\s+(?:\d+\s+)?)\S+", re.I | re.M), r"\1********"),
+    (re.compile(r"^(\s*snmp-server community\s+)\S+", re.I | re.M), r"\1********"),
+    (re.compile(r"^(\s*snmp-server host\s+\S+\s+(?:version\s+\S+\s+)?)\S+", re.I | re.M), r"\1********"),
+    (re.compile(r"((?:irreversible-)?cipher\s+)\S+", re.I), r"\1********"),
+]
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+def clean(raw: str) -> str:
+    text = raw.replace("\r", "")
+    text = VOLATILE.sub("", text)
+    for rx, rep in SECRETS:
+        text = rx.sub(rep, text)
+    lines = [l.rstrip() for l in text.split("\n")]
+    while lines and not lines[0].strip(): lines.pop(0)
+    while lines and not lines[-1].strip(): lines.pop()
+    return "\n".join(l for i, l in enumerate(lines) if l.strip() or (i and lines[i - 1].strip()))
+
+# ---- SSH helpers (live mode) ------------------------------------------------
+def creds(dev: dict) -> tuple[str, str, str]:
+    blob = vault.decrypt_json(dev.get("ssh_enc"))
+    return (dev.get("ssh_user") or SSH_USER, blob.get("password") or SSH_PASS, blob.get("enable") or SSH_ENABLE)
+
+def detect_driver(ip: str, user: str, pw: str) -> str:
+    from netmiko.ssh_autodetect import SSHDetect
+    g = SSHDetect(device_type="autodetect", host=ip, username=user, password=pw, conn_timeout=20)
+    try: return g.autodetect() or "cisco_ios"
+    finally: g.connection.disconnect()
+
+def open_ssh(ip: str, driver: str, user: str, pw: str, enable: str = ""):
+    from netmiko import ConnectHandler           # lazy: not needed in demo mode
+    conn = ConnectHandler(device_type=driver, host=ip, username=user, password=pw, secret=enable, conn_timeout=20)
+    if enable: conn.enable()
+    return conn
+
+def ssh_error_text(e: Exception) -> str:
+    n = type(e).__name__
+    if "Authentication" in n: return "SSH login refused: wrong username or password, or the device (or TACACS+) denied this account."
+    if "Timeout" in n: return "SSH timed out. The device accepted the connection but did not answer in time."
+    return f"{n}: {e}"[:300]
+
+def fetch_running_config(dev: dict) -> str:
+    if MODE == "demo":
+        from . import demo
+        return demo.config_for(dev)
+    user, pw, enable = creds(dev)
+    if not user or not pw:
+        raise RuntimeError("No SSH credentials for this device (and no ARCH_SSH_USER/ARCH_SSH_PASS fallback set)")
+    driver = dev["vendor"]
+    if driver == "autodetect":
+        driver = detect_driver(dev["ip"], user, pw)
+        with connect() as c:
+            c.execute("UPDATE arch_devices SET vendor=? WHERE id=?", (driver, dev["id"]))
+    conn = open_ssh(dev["ip"], driver, user, pw, enable)
+    try:
+        return conn.send_command(SHOW_CMD.get(driver, "show running-config"), read_timeout=90)
+    finally:
+        conn.disconnect()
+
+def event(c, category: str, level: str, text: str):
+    c.execute("INSERT INTO arch_events(ts,category,level,text) VALUES(?,?,?,?)", (utcnow(), category, level, text))
+
+def backup_device(device_id: str, trigger: str = "Scheduled") -> dict:
+    with connect() as c:
+        row = c.execute("SELECT * FROM arch_devices WHERE id=? AND removed_at IS NULL", (device_id,)).fetchone()
+    if not row:
+        raise KeyError(device_id)
+    if row["vendor"] == "snmp_only":
+        return {"ok": False, "error": "This device is SNMP-only, so configuration backup is off."}
+    now = utcnow()
+    try:
+        text = clean(fetch_running_config(dict(row)))
+        if not text.strip():
+            raise RuntimeError("Device returned an empty configuration")
+    except Exception as e:
+        err = ssh_error_text(e) if MODE == "live" else f"{type(e).__name__}: {e}"[:300]
+        with connect() as c:
+            c.execute("INSERT INTO arch_backup_status(device_id,last_attempt,last_error) VALUES(?,?,?) "
+                      "ON CONFLICT(device_id) DO UPDATE SET last_attempt=excluded.last_attempt,last_error=excluded.last_error",
+                      (device_id, now, err))
+            event(c, "Backup", "crit", f"Backup failed for {device_id}: {err}")
+        return {"ok": False, "error": err}
+
+    digest = hashlib.sha256(text.encode()).hexdigest()
+    with connect() as c:
+        last = c.execute("SELECT id, sha256 FROM arch_config_versions WHERE device_id=? ORDER BY id DESC LIMIT 1", (device_id,)).fetchone()
+        changed = last is None or last["sha256"] != digest
+        if changed:
+            vid = c.execute("INSERT INTO arch_config_versions(device_id,taken_at,trigger,sha256,text) VALUES(?,?,?,?,?)",
+                            (device_id, now, trigger, digest, text)).lastrowid
+        else:
+            vid = last["id"]
+        if not c.execute("SELECT 1 FROM arch_baselines WHERE device_id=?", (device_id,)).fetchone():
+            c.execute("INSERT INTO arch_baselines(device_id,version_id,approved_by,approved_at) VALUES(?,?,?,?)",
+                      (device_id, vid, "system (first backup)", now))
+        c.execute("INSERT INTO arch_backup_status(device_id,last_attempt,last_ok,last_error) VALUES(?,?,?,NULL) "
+                  "ON CONFLICT(device_id) DO UPDATE SET last_attempt=excluded.last_attempt,last_ok=excluded.last_ok,last_error=NULL",
+                  (device_id, now, now))
+        if changed and last is not None:
+            event(c, "Backup", "info", f"Config change detected on {device_id} ({trigger}). Backup taken.")
+        elif last is None:
+            event(c, "Backup", "info", f"First backup of {device_id} stored and set as baseline.")
+    return {"ok": True, "changed": changed, "version_id": vid}
+
+def backup_all(trigger: str = "Scheduled") -> dict:
+    with connect() as c:
+        ids = [r["id"] for r in c.execute("SELECT id FROM arch_devices WHERE enabled=1 AND removed_at IS NULL AND vendor!='snmp_only'")]
+    with ThreadPoolExecutor(max_workers=5) as ex:
+        results = dict(zip(ids, ex.map(lambda i: backup_device(i, trigger), ids)))
+    ok = sum(1 for r in results.values() if r["ok"])
+    with connect() as c:
+        event(c, "Backup", "info" if ok == len(ids) else "warn", f"{trigger} backup finished. {ok} of {len(ids)} devices succeeded.")
+    return results

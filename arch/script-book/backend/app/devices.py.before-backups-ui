@@ -1,0 +1,865 @@
+"""Backend for the Devices tab: add, test, list, remove."""
+import ipaddress, re, socket, time
+from datetime import datetime, timedelta, timezone
+from . import backup, demo, vault, snmp
+from .backup import event, utcnow
+from .db import connect
+
+# Labels used by the Add-device dialog -> Netmiko device_type.
+DRIVERS = {"Detect automatically": "autodetect", "Cisco IOS / IOS-XE": "cisco_ios", "Huawei VRP": "huawei",
+           "PLANET managed switch": "cisco_ios",   # Cisco-style CLI; change if your model needs something else
+           "Generic SNMP only": "snmp_only"}
+HOST_RX = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{1,62}$")
+RETENTION_DAYS = 90
+
+def _public(r) -> dict:
+    return {"id": r["id"], "ip": r["ip"], "role": r["role"], "site": r["site"], "model": r["model"], "driver": r["vendor"],
+            "poll_interval": r["poll_interval"], "snmp_version": r["snmp_version"], "ssh_user": r["ssh_user"],
+            "has_ssh_password": bool(r["ssh_enc"] and vault.decrypt_json(r["ssh_enc"]).get("password")),
+            "has_snmp": bool(r["snmp_enc"]), "added_by": r["added_by"], "added_at": r["added_at"]}
+
+def list_devices() -> list[dict]:
+    with connect() as c:
+        return [_public(r) for r in c.execute("SELECT * FROM arch_devices WHERE removed_at IS NULL ORDER BY id")]
+
+def get_interfaces(device_id: str) -> dict:
+    """Retrieve live interface information using the device's saved SNMP credentials."""
+
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM arch_devices WHERE id=? AND removed_at IS NULL",
+            (device_id,)
+        ).fetchone()
+
+    if not row:
+        raise KeyError(device_id)
+
+    if not row["snmp_enc"]:
+        return {
+            "ok": False,
+            "ip": row["ip"],
+            "interface_count": 0,
+            "interfaces": [],
+            "error": "No SNMP credentials configured for this device."
+        }
+
+    credentials = vault.decrypt_json(row["snmp_enc"])
+
+    return snmp.discover_interfaces(
+        ip=row["ip"],
+        version=row["snmp_version"],
+        credentials=credentials,
+    )
+
+def poll_device_interfaces(device_id: str) -> dict:
+    """
+    Collect interface statistics through SNMP and save them
+    into the ARCH monitoring database.
+    """
+
+    # Retrieve the registered device
+    with connect() as c:
+        row = c.execute(
+            """
+            SELECT *
+            FROM arch_devices
+            WHERE id=?
+              AND removed_at IS NULL
+              AND enabled=1
+            """,
+            (device_id,)
+        ).fetchone()
+
+    if not row:
+        return {
+            "ok": False,
+            "device_id": device_id,
+            "error": "Device not found, disabled, or removed."
+        }
+
+    if not row["snmp_enc"]:
+        return {
+            "ok": False,
+            "device_id": device_id,
+            "error": "No SNMP credentials configured."
+        }
+
+    # Decrypt the saved SNMP credentials
+    credentials = vault.decrypt_json(row["snmp_enc"])
+
+    # Collect live interface information
+    result = snmp.discover_interfaces(
+        ip=row["ip"],
+        version=row["snmp_version"],
+        credentials=credentials,
+    )
+
+    if not result.get("ok"):
+        return {
+            "ok": False,
+            "device_id": device_id,
+            "error": result.get("error", "SNMP polling failed.")
+        }
+
+    interfaces = result.get("interfaces", [])
+
+    now = datetime.now(timezone.utc)
+    collected_at = now.isoformat(timespec="seconds")
+
+    # IF-MIB interface status codes
+    status_codes = {
+        "up": 1,
+        "down": 2,
+        "testing": 3,
+        "unknown": 4,
+        "dormant": 5,
+        "notPresent": 6,
+        "lowerLayerDown": 7,
+    }
+
+    def calculate_mbps(current, previous, elapsed):
+        if current is None or previous is None:
+            return None
+
+        if elapsed <= 0 or current < previous:
+            return None
+
+        return round(
+            ((current - previous) * 8) / (elapsed * 1_000_000),
+            3
+        )
+
+    saved = 0
+
+    with connect() as c:
+
+        for interface in interfaces:
+
+            index = int(interface["index"])
+
+            # Retrieve the previous SNMP counter reading
+            previous = c.execute(
+                """
+                SELECT collected_at, in_octets, out_octets
+                FROM arch_interface_stats
+                WHERE device_id=?
+                  AND interface_index=?
+                ORDER BY collected_at DESC, id DESC
+                LIMIT 1
+                """,
+                (device_id, index)
+            ).fetchone()
+
+            in_mbps = None
+            out_mbps = None
+
+            if previous:
+                previous_time = datetime.fromisoformat(
+                    previous["collected_at"]
+                )
+
+                elapsed = (
+                    now - previous_time
+                ).total_seconds()
+
+                in_mbps = calculate_mbps(
+                    interface.get("in_octets"),
+                    previous["in_octets"],
+                    elapsed
+                )
+
+                out_mbps = calculate_mbps(
+                    interface.get("out_octets"),
+                    previous["out_octets"],
+                    elapsed
+                )
+
+            # Update or insert the interface inventory
+            c.execute(
+                """
+                INSERT INTO arch_interfaces (
+                    device_id,
+                    interface_index,
+                    name,
+                    description,
+                    interface_type,
+                    speed_bps,
+                    mtu,
+                    admin_status,
+                    oper_status,
+                    last_seen
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+
+                ON CONFLICT(device_id, interface_index)
+                DO UPDATE SET
+                    name=excluded.name,
+                    description=excluded.description,
+                    interface_type=excluded.interface_type,
+                    speed_bps=excluded.speed_bps,
+                    mtu=excluded.mtu,
+                    admin_status=excluded.admin_status,
+                    oper_status=excluded.oper_status,
+                    last_seen=excluded.last_seen
+                """,
+                (
+                    device_id,
+                    index,
+                    interface.get("name"),
+                    interface.get("description"),
+                    interface.get("type"),
+                    interface.get("speed_bps"),
+                    interface.get("mtu"),
+                    status_codes.get(
+                        interface.get("admin_status"), 4
+                    ),
+                    status_codes.get(
+                        interface.get("oper_status"), 4
+                    ),
+                    collected_at,
+                )
+            )
+
+            # Save the historical SNMP statistics
+            c.execute(
+                """
+                INSERT INTO arch_interface_stats (
+                    device_id,
+                    interface_index,
+                    collected_at,
+                    in_octets,
+                    out_octets,
+                    in_errors,
+                    out_errors,
+                    in_mbps,
+                    out_mbps
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    device_id,
+                    index,
+                    collected_at,
+                    interface.get("in_octets"),
+                    interface.get("out_octets"),
+                    interface.get("in_errors"),
+                    interface.get("out_errors"),
+                    in_mbps,
+                    out_mbps,
+                )
+            )
+
+            saved += 1
+
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "ip": row["ip"],
+        "interface_count": len(interfaces),
+        "interfaces_saved": saved,
+        "collected_at": collected_at,
+        "message": "Interface monitoring data collected successfully."
+    }
+
+def poll_due_interfaces() -> list[dict]:
+    """
+    Poll enabled SNMP devices when their configured interval expires.
+    Track both successful and failed polling attempts.
+    """
+
+    interval_seconds = {
+        "1 minute": 60,
+        "5 minutes": 300,
+        "15 minutes": 900,
+    }
+
+    now = datetime.now(timezone.utc)
+    results = []
+
+    with connect() as c:
+        registered_devices = c.execute("""
+            SELECT id, poll_interval, snmp_enc
+            FROM arch_devices
+            WHERE enabled = 1
+              AND removed_at IS NULL
+              AND snmp_enc IS NOT NULL
+              AND snmp_enc != ''
+            ORDER BY id
+        """).fetchall()
+
+    for device in registered_devices:
+
+        device_id = device["id"]
+        poll_interval = device["poll_interval"]
+
+        interval = interval_seconds.get(poll_interval)
+
+        if interval is None:
+            results.append({
+                "device_id": device_id,
+                "ok": False,
+                "error": f"Unsupported polling interval: {poll_interval}"
+            })
+            continue
+
+        # Check the previous polling attempt
+        with connect() as c:
+            state = c.execute("""
+                SELECT last_attempt_at
+                FROM arch_interface_poll_state
+                WHERE device_id = ?
+            """, (device_id,)).fetchone()
+
+        last_attempt = state["last_attempt_at"] if state else None
+
+        if last_attempt:
+            last_time = datetime.fromisoformat(last_attempt)
+
+            if last_time.tzinfo is None:
+                last_time = last_time.replace(tzinfo=timezone.utc)
+
+            elapsed = (now - last_time).total_seconds()
+
+            if elapsed < interval:
+                continue
+
+        # Record the attempt before contacting the device
+        attempted_at = datetime.now(timezone.utc).isoformat(
+            timespec="seconds"
+        )
+
+        with connect() as c:
+            c.execute("""
+                INSERT INTO arch_interface_poll_state (
+                    device_id,
+                    last_attempt_at
+                )
+                VALUES (?, ?)
+
+                ON CONFLICT(device_id)
+                DO UPDATE SET
+                    last_attempt_at = excluded.last_attempt_at
+            """, (device_id, attempted_at))
+
+        # Perform the actual SNMP poll
+        try:
+            result = poll_device_interfaces(device_id)
+
+        except Exception as exc:
+            result = {
+                "ok": False,
+                "device_id": device_id,
+                "error": type(exc).__name__
+            }
+
+        # Update polling state
+        success_at = (
+            datetime.now(timezone.utc).isoformat(timespec="seconds")
+            if result.get("ok")
+            else None
+        )
+
+        error = None if result.get("ok") else result.get(
+            "error", "Unknown polling error"
+        )
+
+        with connect() as c:
+            c.execute("""
+                UPDATE arch_interface_poll_state
+                SET
+                    last_success_at = COALESCE(?, last_success_at),
+                    last_error = ?
+                WHERE device_id = ?
+            """, (success_at, error, device_id))
+
+        results.append(result)
+
+    return results
+
+def get_interface_monitoring(device_id: str) -> dict:
+    """
+    Return saved interface inventory and the latest
+    monitoring statistics for a device.
+    """
+
+    with connect() as c:
+
+        device = c.execute("""
+            SELECT id, ip, poll_interval
+            FROM arch_devices
+            WHERE id = ?
+              AND removed_at IS NULL
+        """, (device_id,)).fetchone()
+
+        if not device:
+            raise KeyError(device_id)
+
+        rows = c.execute("""
+            SELECT
+                i.interface_index,
+                i.name,
+                i.description,
+                i.interface_type,
+                i.speed_bps,
+                i.mtu,
+                i.admin_status,
+                i.oper_status,
+                i.last_seen,
+
+                s.collected_at,
+                s.in_octets,
+                s.out_octets,
+                s.in_errors,
+                s.out_errors,
+                s.in_mbps,
+                s.out_mbps
+
+            FROM arch_interfaces i
+
+            LEFT JOIN arch_interface_stats s
+                ON s.device_id = i.device_id
+                AND s.interface_index = i.interface_index
+                AND s.id = (
+                    SELECT MAX(s2.id)
+                    FROM arch_interface_stats s2
+                    WHERE s2.device_id = i.device_id
+                      AND s2.interface_index = i.interface_index
+                )
+
+            WHERE i.device_id = ?
+
+            ORDER BY i.interface_index
+        """, (device_id,)).fetchall()
+
+    return {
+        "ok": True,
+        "device_id": device["id"],
+        "ip": device["ip"],
+        "poll_interval": device["poll_interval"],
+        "interface_count": len(rows),
+        "interfaces": [dict(row) for row in rows],
+    }
+
+def get_interface_history(
+    device_id: str,
+    interface_index: int,
+    hours: int = 24
+) -> dict:
+    """
+    Retrieve historical bandwidth readings for an interface.
+    """
+
+    cutoff = (
+        datetime.now(timezone.utc) - timedelta(hours=hours)
+    ).isoformat()
+
+    with connect() as c:
+
+        device = c.execute("""
+            SELECT id, ip
+            FROM arch_devices
+            WHERE id = ?
+              AND removed_at IS NULL
+        """, (device_id,)).fetchone()
+
+        if not device:
+            raise KeyError(device_id)
+
+        interface = c.execute("""
+            SELECT name, description, speed_bps
+            FROM arch_interfaces
+            WHERE device_id = ?
+              AND interface_index = ?
+        """, (device_id, interface_index)).fetchone()
+
+        if not interface:
+            raise KeyError(f"{device_id}:{interface_index}")
+
+        rows = c.execute("""
+            SELECT
+                collected_at,
+                in_mbps,
+                out_mbps,
+                in_octets,
+                out_octets,
+                in_errors,
+                out_errors
+            FROM arch_interface_stats
+            WHERE device_id = ?
+              AND interface_index = ?
+              AND collected_at >= ?
+            ORDER BY collected_at ASC, id ASC
+        """, (device_id, interface_index, cutoff)).fetchall()
+
+    return {
+        "ok": True,
+        "device_id": device_id,
+        "ip": device["ip"],
+        "interface_index": interface_index,
+        "interface_name": interface["name"],
+        "description": interface["description"],
+        "speed_bps": interface["speed_bps"],
+        "period_hours": hours,
+        "sample_count": len(rows),
+        "history": [dict(row) for row in rows]
+    }
+
+def get_interface_summary(device_id: str) -> dict:
+    """
+    Return a device-wide interface monitoring summary.
+    Traffic totals include physical Ethernet interfaces only.
+    """
+
+    result = get_interface_monitoring(device_id)
+
+    interfaces = result["interfaces"]
+
+    physical = [
+        i for i in interfaces
+        if i["interface_type"] == 6
+    ]
+
+    logical = [
+        i for i in interfaces
+        if i["interface_type"] != 6
+    ]
+
+    def count_status(items, status):
+        return sum(
+            1 for i in items
+            if i["oper_status"] == status
+        )
+
+    def sum_values(items, field):
+        return round(
+            sum(
+                i[field] for i in items
+                if i[field] is not None
+            ),
+            3
+        )
+
+    return {
+        "ok": True,
+        "device_id": result["device_id"],
+        "ip": result["ip"],
+
+        "interface_count": len(interfaces),
+
+        "physical_interfaces": len(physical),
+        "logical_interfaces": len(logical),
+
+        "physical_up": count_status(physical, 1),
+        "physical_down": count_status(physical, 2),
+
+        "logical_up": count_status(logical, 1),
+        "logical_down": count_status(logical, 2),
+
+        "physical_inbound_mbps": sum_values(
+            physical, "in_mbps"
+        ),
+
+        "physical_outbound_mbps": sum_values(
+            physical, "out_mbps"
+        ),
+
+        "physical_in_errors": sum_values(
+            physical, "in_errors"
+        ),
+
+        "physical_out_errors": sum_values(
+            physical, "out_errors"
+        ),
+
+        "last_collected": max(
+            (
+                i["collected_at"]
+                for i in interfaces
+                if i["collected_at"]
+            ),
+            default=None
+        )
+    }
+
+def _check(p: dict):
+    if not HOST_RX.match(p["host"]): raise ValueError("Hostname may use letters, numbers, dots and hyphens only.")
+    try:
+        if ipaddress.ip_address(p["ip"]).version != 4: raise ValueError
+    except ValueError: raise ValueError("Enter a valid IPv4 address, for example 10.99.0.31.")
+
+def _snmp_blob(p: dict) -> dict:
+    if p["snmp_version"] == "3":
+        return {k: p[f"snmp_v3_{k}"] for k in ("user", "sec", "auth", "priv", "key", "privkey")} if p["snmp_v3_user"] else {}
+    return {"community": p["snmp_community"]} if p["snmp_community"] else {}
+
+def add_device(p: dict, actor: str) -> dict:
+    _check(p)
+    driver = DRIVERS.get(p["driver"], p["driver"])
+    ssh = {k: v for k, v in (("password", p["ssh_password"]), ("enable", p["ssh_enable"])) if v}
+    snmp = _snmp_blob(p)
+    vals = dict(ip=p["ip"], vendor=driver, role=p["role"] or "Access", site=p["site"] or None, poll_interval=p["poll_interval"],
+                ssh_user=p["ssh_user"] or None, ssh_enc=vault.encrypt_json(ssh) if ssh else None,
+                snmp_version=p["snmp_version"], snmp_enc=vault.encrypt_json(snmp) if snmp else None,
+                added_by=actor, added_at=utcnow())
+    with connect() as c:
+        ex = c.execute("SELECT id, removed_at FROM arch_devices WHERE lower(id)=lower(?)", (p["host"],)).fetchone()
+        if ex and ex["removed_at"] is None: raise FileExistsError(f"{ex['id']} is already monitored.")
+        dup = c.execute("SELECT id FROM arch_devices WHERE ip=? AND removed_at IS NULL", (p["ip"],)).fetchone()
+        if dup: raise FileExistsError(f"{p['ip']} is already monitored as {dup['id']}.")
+        if ex:   # re-adding a recently removed device: bring its kept history back
+            did = ex["id"]
+            c.execute("UPDATE arch_devices SET " + ",".join(f"{k}=?" for k in vals) + ",removed_at=NULL,enabled=1 WHERE id=?", (*vals.values(), did))
+        else:
+            did = p["host"]
+            c.execute("INSERT INTO arch_devices(id," + ",".join(vals) + ") VALUES(?," + ",".join("?" * len(vals)) + ")", (did, *vals.values()))
+        event(c, "User", "info", f"{actor} added {did} ({p['ip']}).")
+        return _public(c.execute("SELECT * FROM arch_devices WHERE id=?", (did,)).fetchone())
+
+
+def update_device(device_id: str, p: dict, actor: str) -> dict:
+    """Update an existing device without replacing its identity or history."""
+
+    _check(p)
+
+    if p["host"].lower() != device_id.lower():
+        raise ValueError("The device hostname cannot be changed during editing.")
+
+    driver = DRIVERS.get(p["driver"], p["driver"])
+
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM arch_devices WHERE id=? AND removed_at IS NULL",
+            (device_id,)
+        ).fetchone()
+
+        if not row:
+            raise KeyError(device_id)
+
+        duplicate = c.execute(
+            "SELECT id FROM arch_devices WHERE ip=? AND removed_at IS NULL AND id<>?",
+            (p["ip"], device_id)
+        ).fetchone()
+
+        if duplicate:
+            raise FileExistsError(
+                f"{p['ip']} is already monitored as {duplicate['id']}."
+            )
+
+        # Preserve existing SSH credentials unless replacements are supplied.
+        ssh = vault.decrypt_json(row["ssh_enc"])
+
+        if p.get("ssh_password"):
+            ssh["password"] = p["ssh_password"]
+
+        if p.get("ssh_enable"):
+            ssh["enable"] = p["ssh_enable"]
+
+        ssh_user = p.get("ssh_user") or row["ssh_user"]
+
+        ssh_enc = (
+            vault.encrypt_json(ssh)
+            if ssh else row["ssh_enc"]
+        )
+
+        c.execute(
+            """
+            UPDATE arch_devices
+            SET ip=?, vendor=?, role=?, site=?, poll_interval=?,
+                ssh_user=?, ssh_enc=?
+            WHERE id=?
+            """,
+            (
+                p["ip"],
+                driver,
+                p["role"] or "Access",
+                p["site"] or None,
+                p["poll_interval"],
+                ssh_user,
+                ssh_enc,
+                device_id,
+            )
+        )
+
+        event(
+            c,
+            "User",
+            "info",
+            f"{actor} updated {device_id} ({p['ip']}, driver: {driver})."
+        )
+
+        updated = c.execute(
+            "SELECT * FROM arch_devices WHERE id=?",
+            (device_id,)
+        ).fetchone()
+
+        return _public(updated)
+
+def remove_device(device_id: str, purge: bool, actor: str):
+    with connect() as c:
+        if not c.execute("SELECT 1 FROM arch_devices WHERE id=? AND removed_at IS NULL", (device_id,)).fetchone():
+            raise KeyError(device_id)
+        if purge:
+            c.execute("DELETE FROM arch_devices WHERE id=?", (device_id,))     # cascades to versions, baseline, status
+        else:
+            c.execute("UPDATE arch_devices SET removed_at=?, enabled=0 WHERE id=?", (utcnow(), device_id))
+        event(c, "User", "warn", f"{actor} removed {device_id}" + (" and deleted its history." if purge else f". History kept for {RETENTION_DAYS} days."))
+
+def purge_expired():
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=RETENTION_DAYS)).isoformat(timespec="seconds")
+    with connect() as c:
+        c.execute("DELETE FROM arch_devices WHERE removed_at IS NOT NULL AND removed_at < ?", (cutoff,))
+
+
+def test_existing_device_connection(device_id: str, p: dict) -> dict:
+    """Test an existing device using saved credentials when form fields are blank."""
+
+    with connect() as c:
+        row = c.execute(
+            "SELECT * FROM arch_devices WHERE id=? AND removed_at IS NULL",
+            (device_id,)
+        ).fetchone()
+
+    if not row:
+        raise KeyError(device_id)
+
+    ssh = vault.decrypt_json(row["ssh_enc"])
+    snmp_credentials = vault.decrypt_json(row["snmp_enc"])
+
+    test_data = dict(p)
+    test_data["host"] = row["id"]
+    test_data["snmp_version"] = row["snmp_version"] or p["snmp_version"]
+    test_data["ssh_user"] = p.get("ssh_user") or row["ssh_user"] or ""
+    test_data["ssh_password"] = p.get("ssh_password") or ssh.get("password", "")
+    test_data["ssh_enable"] = p.get("ssh_enable") or ssh.get("enable", "")
+
+    if row["snmp_enc"]:
+        if test_data["snmp_version"] == "3":
+            for key in ("user", "sec", "auth", "priv", "key", "privkey"):
+                test_data[f"snmp_v3_{key}"] = snmp_credentials.get(key, "")
+        else:
+            test_data["snmp_community"] = snmp_credentials.get("community", "")
+
+    return test_connection(test_data)
+
+
+def test_connection(p: dict) -> dict:
+    """
+    Test SNMP and SSH independently.
+    Never saves credentials or registers a device.
+    """
+    try:
+        _check(p)
+    except ValueError as e:
+        return {"ok": False, "lines": [str(e)], "identity": {}}
+
+    # Preserve the existing simulated behavior in demo mode.
+    if backup.MODE == "demo":
+        return demo.fake_test(p)
+
+    ip = p["ip"]
+    lines = []
+    identity = {}
+
+    driver = DRIVERS.get(p["driver"], p["driver"])
+
+    # ---------------------------------------------------------
+    # 1. SNMP connectivity test
+    # ---------------------------------------------------------
+    snmp_credentials = _snmp_blob(p)
+    snmp_configured = bool(snmp_credentials)
+    snmp_ok = False
+
+    if snmp_configured:
+        lines.append(f"Testing SNMP on {ip} (UDP 161)...")
+
+        result = snmp.test_snmp(
+            ip=ip,
+            version=p["snmp_version"],
+            credentials=snmp_credentials,
+        )
+
+        snmp_ok = result.get("ok", False)
+        identity = result.get("identity", {})
+        lines.extend(result.get("lines", []))
+    else:
+        lines.append("SNMP not tested: credentials were not supplied.")
+
+    # ---------------------------------------------------------
+    # 2. SNMP-only devices do not require SSH
+    # ---------------------------------------------------------
+    if driver == "snmp_only":
+        lines.append(
+            "SSH not tested: this device is configured as SNMP-only. "
+            "Configuration backup is disabled."
+        )
+
+        return {
+            "ok": snmp_configured and snmp_ok,
+            "lines": lines,
+            "identity": identity,
+        }
+
+    # ---------------------------------------------------------
+    # 3. SSH connectivity and login test
+    # ---------------------------------------------------------
+    user = p.get("ssh_user") or backup.SSH_USER
+    password = p.get("ssh_password") or backup.SSH_PASS
+    enable_password = p.get("ssh_enable") or backup.SSH_ENABLE
+
+    ssh_ok = False
+
+    if not user or not password:
+        lines.append(
+            "SSH not tested: username or password is missing."
+        )
+    else:
+        start_time = time.time()
+
+        try:
+            socket.create_connection((ip, 22), timeout=5).close()
+
+            elapsed = (time.time() - start_time) * 1000
+            lines.append(
+                f"SSH port reachable on TCP 22 ({elapsed:.0f} ms)."
+            )
+
+            if driver == "autodetect":
+                driver = backup.detect_driver(ip, user, password)
+
+            connection = backup.open_ssh(
+                ip, driver, user, password, enable_password
+            )
+
+            try:
+                prompt = connection.find_prompt()
+            finally:
+                connection.disconnect()
+
+            ssh_ok = True
+            lines.append(
+                f"SSH login accepted. Driver: {driver}. Prompt: {prompt}"
+            )
+
+        except OSError as e:
+            lines.append(
+                f"SSH connection failed: {e.strerror or str(e)}"
+            )
+            lines.append(
+                "Check routing, firewall ACLs, and whether SSH is enabled."
+            )
+
+        except Exception as e:
+            lines.append(backup.ssh_error_text(e))
+
+    # ---------------------------------------------------------
+    # 4. Calculate the overall result
+    # ---------------------------------------------------------
+    # SSH is required for devices that support configuration backup.
+    # If SNMP credentials were supplied, SNMP must also succeed.
+    ok = ssh_ok and (not snmp_configured or snmp_ok)
+
+    return {
+        "ok": ok,
+        "lines": lines,
+        "identity": identity,
+    }

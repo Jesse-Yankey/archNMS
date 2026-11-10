@@ -1,0 +1,295 @@
+from contextlib import asynccontextmanager
+from pathlib import Path
+import os
+from apscheduler.schedulers.background import BackgroundScheduler
+from fastapi import BackgroundTasks, FastAPI, Header, HTTPException, Query
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
+from . import backup, configs, db, demo, devices, latency
+
+def nightly():
+    devices.purge_expired()
+    latency.purge_expired()
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    db.init()
+
+    if backup.MODE == "demo" and os.environ.get("ARCH_DEMO_SEED", "1") == "1":
+        demo.seed()
+
+    sched = BackgroundScheduler(timezone=backup.TZ_NAME)
+
+    # Automatic configuration backups
+    backup_interval = int(
+        os.environ.get("ARCH_BACKUP_INTERVAL_MINUTES", "15")
+    )
+
+    if backup_interval not in (5, 15, 30, 60):
+        raise ValueError(
+            "ARCH_BACKUP_INTERVAL_MINUTES must be 5, 15, 30 or 60"
+        )
+
+    sched.add_job(
+        backup.backup_all,
+        "interval",
+        minutes=backup_interval,
+        id="automatic-config-backup",
+        kwargs={"trigger": "Automatic backup"},
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=60
+    )
+
+    # Nightly device maintenance
+    sched.add_job(
+        nightly,
+        "cron",
+        hour=int(os.environ.get("ARCH_BACKUP_HOUR", "2")),
+        minute=0,
+        id="nightly-cleanup"
+    )
+
+    # Automatic SNMP interface monitoring
+    sched.add_job(
+        devices.poll_due_interfaces,
+        "interval",
+        seconds=15,
+        id="interface-polling",
+        max_instances=1,
+        coalesce=True,
+        misfire_grace_time=30
+    )
+
+    # ICMP latency monitoring is disabled unless explicitly enabled.
+    if os.environ.get("ARCH_LATENCY_ENABLED", "0") == "1":
+        sched.add_job(
+            latency.collect_all,
+            "interval",
+            seconds=60,
+            id="icmp-latency-monitoring",
+            max_instances=1,
+            coalesce=True,
+            misfire_grace_time=30
+        )
+
+    sched.start()
+
+    yield
+
+    sched.shutdown(wait=False)
+
+app = FastAPI(title="ARCH Monitoring Station", lifespan=lifespan)
+
+class BackupReq(BaseModel):
+    trigger: str = "Manual backup"       # e.g. "Change detected from syslog" when the Syslog tab calls this
+
+class DeviceIn(BaseModel):
+    host: str
+    ip: str
+    driver: str = "Detect automatically"
+    role: str = "Access"
+    site: str = ""
+    poll_interval: str = "1 minute"
+    snmp_version: str = "2c"
+    snmp_community: str = ""
+    snmp_v3_user: str = ""
+    snmp_v3_sec: str = "authPriv"
+    snmp_v3_auth: str = "SHA-256"
+    snmp_v3_priv: str = "AES-256"
+    snmp_v3_key: str = ""
+    snmp_v3_privkey: str = ""
+    ssh_user: str = ""
+    ssh_password: str = ""
+    ssh_enable: str = ""
+
+# ---- Devices tab ----
+@app.get("/api/devices")
+def list_devices(): return devices.list_devices()
+
+@app.get("/api/devices/{device_id}/interfaces")
+def get_device_interfaces(device_id: str):
+    try:
+        return devices.get_interfaces(device_id)
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+
+@app.get("/api/devices/{device_id}/interface-monitoring")
+def get_device_interface_monitoring(device_id: str):
+    try:
+        return devices.get_interface_monitoring(device_id)
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+
+@app.get("/api/devices/{device_id}/interface-summary")
+def get_device_interface_summary(device_id: str):
+    try:
+        return devices.get_interface_summary(device_id)
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+
+@app.get("/api/devices/{device_id}/interfaces/{interface_index}/history")
+def get_device_interface_history(
+    device_id: str,
+    interface_index: int,
+    hours: int = Query(default=24, ge=1, le=720)
+):
+    try:
+        return devices.get_interface_history(
+            device_id=device_id,
+            interface_index=interface_index,
+            hours=hours
+        )
+
+    except KeyError:
+        raise HTTPException(
+            status_code=404,
+            detail="Device or interface not found"
+        )
+
+@app.post("/api/devices/test")
+def test_device(body: DeviceIn): return devices.test_connection(body.model_dump())
+
+@app.post("/api/devices", status_code=201)
+def add_device(body: DeviceIn, bg: BackgroundTasks, x_arch_user: str = Header("unknown")):
+    try:
+        dev = devices.add_device(body.model_dump(), x_arch_user)
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except FileExistsError as e:
+        raise HTTPException(409, str(e))
+
+    # SNMP-only devices do not support configuration backups.
+    if dev["driver"] != "snmp_only":
+        bg.add_task(backup.backup_device, dev["id"], "Device added")
+
+    return dev
+
+@app.post("/api/devices/{device_id}/test")
+def test_existing_device(device_id: str, body: DeviceIn):
+    try:
+        return devices.test_existing_device_connection(
+            device_id, body.model_dump()
+        )
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+
+
+@app.put("/api/devices/{device_id}")
+def update_device(
+    device_id: str,
+    body: DeviceIn,
+    bg: BackgroundTasks,
+    x_arch_user: str = Header("unknown")
+):
+    try:
+        dev = devices.update_device(
+            device_id, body.model_dump(), x_arch_user
+        )
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except FileExistsError as e:
+        raise HTTPException(409, str(e))
+
+    if dev["driver"] != "snmp_only":
+        bg.add_task(backup.backup_device, dev["id"], "Device updated")
+
+    return dev
+
+
+@app.delete("/api/devices/{device_id}")
+def remove_device(device_id: str, purge: bool = False, x_arch_user: str = Header("unknown")):
+    try: devices.remove_device(device_id, purge, x_arch_user)
+    except KeyError: raise HTTPException(404, "Unknown device")
+    return {"ok": True}
+
+# ---- Configurations / Config drift tabs ----
+@app.get("/api/configs")
+def list_configs(): return configs.state()
+
+@app.get("/api/drift")
+def list_drift(): return configs.drift_summary()
+
+@app.post("/api/devices/{device_id}/backup")
+def run_backup(device_id: str, body: BackupReq | None = None):
+    try: return backup.backup_device(device_id, (body or BackupReq()).trigger)
+    except KeyError: raise HTTPException(404, "Unknown device")
+
+@app.post("/api/backups/run")
+def run_all(): return backup.backup_all("Manual backup")
+
+
+@app.get("/api/backups/events")
+def get_backup_events(
+    days: int = Query(default=90, ge=1, le=365)
+):
+    """Return individual backup attempts for the Backups calendar."""
+    with db.connect() as c:
+        rows = c.execute(
+            """
+            SELECT id, ts, level, text
+            FROM arch_events
+            WHERE category = 'Backup'
+              AND ts >= datetime('now', ?)
+              AND (
+                  text LIKE '% successful for %'
+                  OR text LIKE '% failed for %'
+              )
+            ORDER BY ts DESC
+            LIMIT 5000
+            """,
+            (f"-{days} days",)
+        ).fetchall()
+
+    events = []
+    for row in rows:
+        text = row["text"]
+        success = " successful for " in text
+        marker = " successful for " if success else " failed for "
+        device_id = text.split(marker, 1)[1].split(".", 1)[0].split(":", 1)[0]
+
+        events.append({
+            "id": row["id"],
+            "ts": row["ts"],
+            "device_id": device_id,
+            "status": "success" if success else "failed",
+            "level": row["level"],
+            "text": text
+        })
+
+    return events
+
+# ---- Latency monitoring tab ----
+@app.get("/api/latency/targets")
+def get_latency_targets():
+    return latency.targets()
+
+@app.get("/api/latency/{device_id}/history")
+def get_latency_history(
+    device_id: str,
+    hours: int = Query(default=24, ge=1, le=168)
+):
+    try:
+        return latency.history(device_id, hours)
+    except KeyError:
+        raise HTTPException(404, "Unknown device")
+
+@app.post("/api/latency/collect")
+def collect_latency_now():
+    if os.environ.get("ARCH_LATENCY_ENABLED", "0") != "1":
+        raise HTTPException(
+            409,
+            "ICMP monitoring is disabled. Enable ARCH_LATENCY_ENABLED first."
+        )
+    return latency.collect_all()
+
+@app.post("/api/devices/{device_id}/baseline")
+def accept(device_id: str, x_arch_user: str = Header("unknown")):
+    try: return configs.accept_baseline(device_id, x_arch_user)
+    except LookupError as e: raise HTTPException(409, str(e))
+
+# Frontend last, so /api/* wins.
+app.mount("/", StaticFiles(directory=Path(__file__).resolve().parents[2] / "frontend", html=True), name="ui")
